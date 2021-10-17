@@ -4,7 +4,7 @@ set -eu
 
 REPO=mikegleasonjr
 NAME=dnswarmer
-VERSION=0.0.1
+VERSION=0.0.2
 PLATFORMS=linux/arm/v7,linux/arm64/v8,linux/amd64
 IMAGE="${REPO}/${NAME}"
 

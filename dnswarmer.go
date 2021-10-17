@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"time"
 
@@ -13,17 +12,15 @@ import (
 )
 
 var (
-	upstream  = kingpin.Flag("upstream", "Upstream DNS server to query.").Short('u').Required().String()
-	listen    = kingpin.Flag("bind", "Bind address.").Short('b').Default(":5353").String()
-	cacheSize = kingpin.Flag("max", "Max number of popular domains to warm up.").Default("512").Short('m').Int()
+	upstream = kingpin.Flag("upstream", "Upstream DNS server to query.").Short('u').Required().String()
+	listen   = kingpin.Flag("bind", "Bind address.").Short('b').Default(":5353").String()
+	count    = kingpin.Flag("count", "Number of popular domains to keep warm.").Default("512").Short('c').Uint16()
 )
 
 var cache gcache.Cache
 
 func main() {
 	kingpin.Parse()
-
-	cache = gcache.New(*cacheSize).LFU().Build()
 
 	udpclients, err := net.ListenPacket("udp", *listen)
 	if err != nil {
@@ -33,15 +30,15 @@ func main() {
 	defer udpclients.Close()
 
 	client := new(dns.Client)
-	client.SingleInflight = true
-
+	cache = gcache.New(int(*count)).LFU().Build()
 	quit := make(chan struct{})
-	go warmer(5*time.Second, cache, client, quit)
+
+	go warmer(60*time.Second, cache, client, quit)
 
 	dns.ActivateAndServe(nil, udpclients, dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
 		response, rtt, err := client.Exchange(request, *upstream)
 		if err != nil {
-			log.Println(err)
+			log.Println(fmt.Errorf("[%s] error forwarding %s to upstream: %w", dns.TypeToString[request.Question[0].Qtype], request.Question[0].Name, err))
 			response = new(dns.Msg).SetRcode(request, dns.RcodeServerFailure)
 		}
 
@@ -56,7 +53,7 @@ func main() {
 
 type entry struct {
 	Name    string
-	Qtype   uint16
+	Type    uint16
 	Expires time.Time
 }
 
@@ -66,21 +63,17 @@ func onResponse(response *dns.Msg, rtt time.Duration) {
 	}
 
 	question := response.Question[0]
-	var ok bool
-	var ttl uint32
 
-	if ok, ttl = shortestTtl(question.Name, response.Answer); !ok {
-		return
+	if ok, ttl := firstTTL(question.Name, response.Answer); ok {
+		key := fmt.Sprintf("[%s]%s", dns.TypeToString[question.Qtype], question.Name)
+		entry := &entry{
+			Name:    question.Name,
+			Type:    question.Qtype,
+			Expires: time.Now().Add(time.Duration(ttl) * time.Second),
+		}
+
+		cache.Set(key, entry)
 	}
-
-	key := fmt.Sprintf("%s_%d", question.Name, question.Qtype)
-	entry := &entry{
-		Name:    question.Name,
-		Qtype:   question.Qtype,
-		Expires: time.Now().Add(time.Duration(ttl) * time.Second),
-	}
-
-	cache.Set(key, entry)
 }
 
 func warmer(interval time.Duration, cache gcache.Cache, client *dns.Client, quit <-chan struct{}) {
@@ -99,16 +92,16 @@ func warmer(interval time.Duration, cache gcache.Cache, client *dns.Client, quit
 
 				m := new(dns.Msg)
 				m.SetEdns0(4096, true)
-				m.SetQuestion(ent.Name, ent.Qtype)
+				m.SetQuestion(ent.Name, ent.Type)
 
 				res, _, err := client.Exchange(m, *upstream)
 				if err != nil {
-					log.Println(err)
+					log.Println(fmt.Errorf("[%s] error warming %s to upstream: %w", dns.TypeToString[ent.Type], ent.Name, err))
 					continue
 				}
 
-				log.Printf("warmed %s\n", ent.Name)
-				if ok, ttl := shortestTtl(ent.Name, res.Answer); ok {
+				log.Printf("[%s] warmed up %s\n", dns.TypeToString[ent.Type], ent.Name)
+				if ok, ttl := firstTTL(ent.Name, res.Answer); ok {
 					ent.Expires = time.Now().Add(time.Duration(ttl) * time.Second)
 				}
 			}
@@ -118,23 +111,14 @@ func warmer(interval time.Duration, cache gcache.Cache, client *dns.Client, quit
 	}
 }
 
-func shortestTtl(name string, answers []dns.RR) (bool, uint32) {
-	shortestTtl := uint32(math.MaxUint32)
-
+func firstTTL(name string, answers []dns.RR) (bool, uint32) {
 	for _, answer := range answers {
 		header := answer.Header()
 
-		if name != header.Name ||
-			header.Ttl > shortestTtl {
-			continue
+		if name == header.Name {
+			return true, header.Ttl
 		}
-
-		shortestTtl = header.Ttl
 	}
 
-	if shortestTtl == math.MaxUint32 {
-		return false, 0
-	}
-
-	return true, shortestTtl
+	return false, 0
 }
